@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.11.2](https://github.com/trapped/actual-mcp/compare/v1.11.1...v1.11.2) (2026-03-27)
+
+
+### Bug Fixes
+
+* create Server instance per connection to prevent crash ([c9a403a](https://github.com/trapped/actual-mcp/commit/c9a403a69cba719c025f0133c7df9995757f5a9c))
+
 ## [1.11.1](https://github.com/s-stefanov/actual-mcp/compare/v1.11.0...v1.11.1) (2026-03-09)
 
 
