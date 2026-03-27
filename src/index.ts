@@ -28,22 +28,6 @@ import { SetLevelRequestSchema, isInitializeRequest } from '@modelcontextprotoco
 // Reason: dotenv@17 (dotenvx) prints to stdout by default, which breaks MCP stdio JSON parsing
 dotenv.config({ path: '.env', quiet: true } as Parameters<typeof dotenv.config>[0]);
 
-// Initialize the MCP server
-const server = new Server(
-  {
-    name: 'Actual Budget',
-    version: '1.0.0',
-  },
-  {
-    capabilities: {
-      resources: {},
-      tools: {},
-      prompts: {},
-      logging: {},
-    },
-  }
-);
-
 // Argument parsing
 const {
   values: {
@@ -67,6 +51,38 @@ const {
 });
 
 const resolvedPort = port ? parseInt(port, 10) : 3000;
+
+// Factory: creates a fully configured MCP server instance per connection.
+// The MCP SDK Server only supports a single transport at a time, so each
+// concurrent connection (SSE client, Streamable HTTP session, stdio) needs
+// its own Server instance.
+function createServer(): Server {
+  const server = new Server(
+    {
+      name: 'Actual Budget',
+      version: '1.0.0',
+    },
+    {
+      capabilities: {
+        resources: {},
+        tools: {},
+        prompts: {},
+        logging: {},
+      },
+    }
+  );
+
+  setupResources(server);
+  setupTools(server, enableWrite);
+  setupPrompts(server);
+
+  server.setRequestHandler(SetLevelRequestSchema, (request) => {
+    console.log(`--- Logging level: ${request.params.level}`);
+    return {};
+  });
+
+  return server;
+}
 
 // Bearer authentication middleware
 const bearerAuth = (req: Request, res: Response, next: NextFunction): void => {
@@ -179,6 +195,7 @@ async function main(): Promise<void> {
   if (useSse) {
     const app = express();
     app.use(express.json());
+    let sseServer: Server | null = null;
     let transport: SSEServerTransport | null = null;
 
     // Log bearer auth status
@@ -189,6 +206,7 @@ async function main(): Promise<void> {
     }
 
     const streamableHttpTransports = new Map<string, StreamableHTTPServerTransport>();
+    const streamableHttpServers = new Map<string, Server>();
 
     const parseSessionHeader = (value: string | string[] | undefined): string | undefined => {
       if (!value) {
@@ -205,11 +223,16 @@ async function main(): Promise<void> {
     });
 
     const handleLegacySse = (req: Request, res: Response): void => {
+      if (sseServer) {
+        sseServer.close();
+      }
+      sseServer = createServer();
       transport = new SSEServerTransport('/messages', res);
-      server.connect(transport).then(() => {
-        console.log = (message: string) => server.sendLoggingMessage({ level: 'info', data: message });
+      sseServer.connect(transport).then(() => {
+        const connectedServer = sseServer!;
+        console.log = (message: string) => connectedServer.sendLoggingMessage({ level: 'info', data: message });
 
-        console.error = (message: string) => server.sendLoggingMessage({ level: 'error', data: message });
+        console.error = (message: string) => connectedServer.sendLoggingMessage({ level: 'error', data: message });
 
         console.error(`Actual Budget MCP Server (SSE) started on port ${resolvedPort}`);
       });
@@ -232,14 +255,21 @@ async function main(): Promise<void> {
         if (!streamableTransport) {
           if (req.method === 'POST' && isInitializeRequest(req.body)) {
             const remoteAddress = req.ip ?? req.socket.remoteAddress ?? 'unknown';
+            const sessionServer = createServer();
             streamableTransport = new StreamableHTTPServerTransport({
               sessionIdGenerator: () => randomUUID(),
               onsessioninitialized: (sessionId) => {
                 streamableHttpTransports.set(sessionId, streamableTransport!);
+                streamableHttpServers.set(sessionId, sessionServer);
                 console.info(`Streamable HTTP session initialized (session ${sessionId}) from ${remoteAddress}`);
               },
               onsessionclosed: (sessionId) => {
                 streamableHttpTransports.delete(sessionId);
+                const closingServer = streamableHttpServers.get(sessionId);
+                if (closingServer) {
+                  closingServer.close();
+                  streamableHttpServers.delete(sessionId);
+                }
                 console.info(`Streamable HTTP session closed (session ${sessionId})`);
               },
             });
@@ -248,16 +278,21 @@ async function main(): Promise<void> {
               const activeSessionId = streamableTransport?.sessionId;
               if (activeSessionId) {
                 streamableHttpTransports.delete(activeSessionId);
+                const closingServer = streamableHttpServers.get(activeSessionId);
+                if (closingServer) {
+                  closingServer.close();
+                  streamableHttpServers.delete(activeSessionId);
+                }
                 console.info(`Streamable HTTP transport closed (session ${activeSessionId})`);
               }
             };
 
             try {
-              await server.connect(streamableTransport);
+              await sessionServer.connect(streamableTransport);
 
-              console.log = (message: string) => server.sendLoggingMessage({ level: 'info', data: message });
+              console.log = (message: string) => sessionServer.sendLoggingMessage({ level: 'info', data: message });
 
-              console.error = (message: string) => server.sendLoggingMessage({ level: 'error', data: message });
+              console.error = (message: string) => sessionServer.sendLoggingMessage({ level: 'error', data: message });
 
               console.error(`Actual Budget MCP Server (Streamable HTTP) started on port ${resolvedPort}`);
             } catch (error) {
@@ -330,44 +365,31 @@ async function main(): Promise<void> {
       }
     });
   } else {
+    const stdioServer = createServer();
     const transport = new StdioServerTransport();
-    await server.connect(transport);
+    await stdioServer.connect(transport);
     console.error('Actual Budget MCP Server (stdio) started');
+
+    // Redirect console to MCP logging for stdio transport
+    console.log = (message: string) =>
+      stdioServer.sendLoggingMessage({
+        level: 'info',
+        data: message,
+      });
+    console.error = (message: string) =>
+      stdioServer.sendLoggingMessage({
+        level: 'error',
+        data: message,
+      });
   }
 }
 
-setupResources(server);
-setupTools(server, enableWrite);
-setupPrompts(server);
-
-server.setRequestHandler(SetLevelRequestSchema, (request) => {
-  console.log(`--- Logging level: ${request.params.level}`);
-  return {};
-});
-
 process.on('SIGINT', () => {
   console.error('SIGINT received, shutting down server');
-  server.close();
   process.exit(0);
 });
 
-main()
-  .then(() => {
-    if (!useSse) {
-      // TODO: Setup proper logging level change. Messages are available in the notification of MCP Inspector
-      console.log = (message: string) =>
-        server.sendLoggingMessage({
-          level: 'info',
-          data: message,
-        });
-      console.error = (message: string) =>
-        server.sendLoggingMessage({
-          level: 'error',
-          data: message,
-        });
-    }
-  })
-  .catch((error: unknown) => {
-    console.error(`Server error: ${toErrorMessage(error)}`);
-    process.exit(1);
-  });
+main().catch((error: unknown) => {
+  console.error(`Server error: ${toErrorMessage(error)}`);
+  process.exit(1);
+});
